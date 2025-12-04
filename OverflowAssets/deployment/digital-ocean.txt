@@ -1,0 +1,264 @@
+DIGITAL OCEAN DEPLOYMENT SNIPPETS
+=================================
+
+=====
+Add the ACME companion to the AppHost:
+=====
+
+if (!builder.Environment.IsDevelopment())
+{
+    builder.AddContainer("nginx-proxy", "nginxproxy/nginx-proxy", "1.8")
+        .WithEndpoint(80, 80, "nginx", isExternal: true)
+        .WithEndpoint(443, 443, "nginx-ssl", isExternal: true)
+        .WithBindMount("/var/run/docker.sock", "/tmp/docker.sock", true)
+        .WithVolume("certs", "/etc/nginx/certs", false)
+        .WithVolume("html", "/usr/share/nginx/html", false)
+        .WithVolume("vhost", "/etc/nginx/vhost.d")
+        .WithContainerName("nginx-proxy");
+    
+    builder.AddContainer("nginx-proxy-acme", "nginxproxy/acme-companion", "2.2")
+        .WithEnvironment("DEFAULT_EMAIL", "your-email@address.com")
+        .WithEnvironment("NGINX_PROXY_CONTAINER", "nginx-proxy")
+        .WithBindMount("/var/run/docker.sock", "/var/run/docker.sock", isReadOnly: true)
+        .WithVolume("certs", "/etc/nginx/certs")
+        .WithVolume("html", "/usr/share/nginx/html")
+        .WithVolume("vhost", "/etc/nginx/vhost.d", false)
+        .WithVolume("acme", "/etc/acme.sh");
+}
+
+=====
+Create the GitHub workflow.  Create .github/workflows/aspire-deploy.yml in the root of the solution with the following code:
+=====
+
+name: Aspire Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  OUTPUT_DIR: infra
+  IMAGE_PREFIX: docker-username/overflow
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET and Aspire CLI
+        run: |
+          # Install .NET 9.0.302
+          curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --version 9.0.302 --install-dir "$HOME/.dotnet"
+          echo "$HOME/.dotnet" >> $GITHUB_PATH
+          export PATH="$HOME/.dotnet:$PATH"
+          
+          # Install Aspire CLI
+          curl -sSL https://aspire.dev/install.sh | bash
+
+      - name: Create webapp/.env.production from GitHub Secrets
+        run: |
+          cat <<EOF > webapp/.env.production
+          API_URL=${{ secrets.API_URL }}
+          AUTH_KEYCLOAK_ID=${{ secrets.AUTH_KEYCLOAK_ID }}
+          AUTH_KEYCLOAK_SECRET=${{ secrets.AUTH_KEYCLOAK_SECRET }}
+          AUTH_KEYCLOAK_ISSUER=${{ secrets.AUTH_KEYCLOAK_ISSUER }}
+          AUTH_KEYCLOAK_ISSUER_INTERNAL=${{ secrets.AUTH_KEYCLOAK_ISSUER_INTERNAL }}
+          AUTH_URL=${{ secrets.AUTH_URL }}
+          AUTH_URL_INTERNAL=${{ secrets.AUTH_URL_INTERNAL }}
+          AUTH_SECRET=${{ secrets.AUTH_SECRET }}
+          NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME=${{ secrets.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME }}
+          NEXT_PUBLIC_CLOUDINARY_API_KEY=${{ secrets.NEXT_PUBLIC_CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET=${{ secrets.CLOUDINARY_API_SECRET }}
+          EOF
+
+      - name: Publish Aspire app
+        run: |
+          mkdir -p infra
+          aspire publish -o ${{ env.OUTPUT_DIR }}
+
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Tag and push images to Docker Hub
+        run: |
+          TAG="latest"
+          PREFIX="${{ env.IMAGE_PREFIX}}"
+          SERVICES=(
+            question-svc
+            profile-svc
+            vote-svc
+            search-svc
+            stat-svc
+            webapp
+          )
+
+          for svc in "${SERVICES[@]}"; do
+            LOCAL_IMAGE="${svc}:latest"
+            REMOTE_IMAGE="${PREFIX}-${svc}:${TAG}"
+
+            echo "📦 Tagging $LOCAL_IMAGE → $REMOTE_IMAGE"
+            docker tag "$LOCAL_IMAGE" "$REMOTE_IMAGE"
+
+            echo "🚀 Pushing $REMOTE_IMAGE"
+            docker push "$REMOTE_IMAGE"
+          done
+
+      - name: Upload docker-compose.yml to server
+        uses: appleboy/scp-action@v1
+        with:
+          timeout: 120s
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_PRIVATE_KEY }}
+          source: "${{ env.OUTPUT_DIR }}/docker-compose.yaml"
+          target: "~/overflow"
+
+      - name: SSH and deploy via Docker Compose
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/overflow/infra
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+
+
+=====
+Create Github repo secrets for the nextjs app.
+=====
+
+1. Instal the GitHub CLI.
+2. Login to GitHub using: gh auth login
+3. Set the repo using: gh repo set-default owner/repo
+
+=====
+Create the script to populate the secrets in GitHub secrets
+=====
+
+-------------
+MAC OSX/LINUX
+-------------
+
+FILENAME: set-gh-secrets.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# path to .env
+ENV_FILE=".gh-secrets"
+
+while IFS= read -r line || [ -n "$line" ]; do
+  # skip empty lines and comments
+  if [[ -z "$line" || "$line" =~ ^# ]]; then
+    continue
+  fi
+
+  key="${line%%=*}"
+  value="${line#*=}"
+
+  # strip surrounding quotes if present
+  value="${value%\"}"
+  value="${value#\"}"
+
+  echo "Setting secret: $key"
+  gh secret set "$key" --body "$value"
+done < "$ENV_FILE"
+
+TO RUN USE THE FOLLOWING:
+
+chmod +x set-gh-secrets.sh
+./set-gh-secrets.sh
+
+-------
+WINDOWS
+-------
+
+FILENAME: set-gh-secrets.ps1
+
+$envFile = ".gh-secrets"
+
+Get-Content $envFile | ForEach-Object {
+    $line = $_.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($line) -and -not $line.StartsWith("#")) {
+        $parts = $line -split '=',2
+        $key = $parts[0].Trim()
+        $value = $parts[1].Trim('"')
+        Write-Host "Setting secret: $key"
+        gh secret set $key --body $value
+    }
+}
+
+TO RUN USE THE FOLLOWING:
+
+pwsh set-secrets.ps1
+
+=====
+Importing the realm into production on Digital Ocean
+=====
+
+Run the following command inside the infra/do folder to get the realm exported from the production version
+
+docker run --rm \
+  -v keycloak-data:/opt/keycloak/data \
+  -v $(pwd)/realms:/opt/keycloak/export \
+  quay.io/keycloak/keycloak:26.2 \
+  export --realm overflow --dir /opt/keycloak/export --users realm_file
+
+
+=====
+Adding a bit of resiliency
+=====
+
+We can ensure when the server restarts we run docker compose up -d automatically by doing the following:
+
+1. Ensure docker is enabled as a service (it will be if you used the ubuntu with docker installed)
+
+sudo systemctl is-enabled docker
+
+2. Create the service file:
+
+sudo nano /etc/systemd/system/overflow.service
+
+3. Paste in the following configuration code:
+
+[Unit]
+Description=Overflow Docker Compose App
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+WorkingDirectory=/root/overflow/infra
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+
+4. Exit and save by using CTRL + X and selecting Yes to save changes
+
+5. Run the following commands to restart the deamon, enable the service, start the service and check the service:
+
+sudo systemctl daemon-reexec
+sudo systemctl enable overflow.service
+sudo systemctl start overflow.service
+sudo systemctl status overflow.service
+
+6. Reboot the server:
+
+sudo reboot
+
+7. Ensure the docker containers are running:
+
+docker ps
+

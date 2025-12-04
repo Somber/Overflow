@@ -1,0 +1,5 @@
+docker run --rm \
+  -v keycloak-data:/opt/keycloak/data \
+  -v $(pwd)/realms:/opt/keycloak/export \
+  quay.io/keycloak/keycloak:26.2 \
+  export --realm overflow --dir /opt/keycloak/export --users realm_file

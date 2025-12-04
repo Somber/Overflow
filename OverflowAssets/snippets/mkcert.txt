@@ -1,0 +1,1 @@
+mkcert -key-file overflow.local.key -cert-file overflow.local.crt app.overflow.local api.overflow.local id.overflow.local
